@@ -74,6 +74,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".php": "php",
     ".sol": "solidity",
     ".vue": "vue",
+    ".mjs": "javascript",
+    ".astro": "typescript",
 }
 
 # Tree-sitter node type mappings per language
@@ -599,10 +601,14 @@ class CodeParser:
             if node_type in import_types:
                 imports = self._extract_import(child, language, source)
                 for imp_target in imports:
+                    # Resolve relative/module imports to absolute file paths
+                    resolved = self._resolve_module_to_file(
+                        imp_target, file_path, language,
+                    )
                     edges.append(EdgeInfo(
                         kind="IMPORTS_FROM",
                         source=file_path,
-                        target=imp_target,
+                        target=resolved if resolved else imp_target,
                         file_path=file_path,
                         line=child.start_point[0] + 1,
                     ))
