@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -130,12 +131,17 @@ def _is_binary(path: Path) -> bool:
 
 _GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds, configurable
 
+_SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9_.~^/@{}\-]+$")
+
 
 def get_changed_files(repo_root: Path, base: str = "HEAD~1") -> list[str]:
     """Get list of changed files via git diff."""
+    if not _SAFE_GIT_REF.match(base):
+        logger.warning("Invalid git ref rejected: %s", base)
+        return []
     try:
         result = subprocess.run(
-            ["git", "diff", "--name-only", base],
+            ["git", "diff", "--name-only", base, "--"],
             capture_output=True,
             text=True,
             cwd=str(repo_root),
@@ -446,9 +452,12 @@ def watch(repo_root: Path, store: GraphStore) -> None:
                 return
             if _should_ignore(rel, ignore_patterns):
                 return
-            store.remove_file_data(event.src_path)
-            store.commit()
-            logger.info("Removed: %s", rel)
+            try:
+                store.remove_file_data(event.src_path)
+                store.commit()
+                logger.info("Removed: %s", rel)
+            except Exception as e:
+                logger.error("Error removing %s: %s", rel, e)
 
         def _schedule(self, abs_path: str):
             """Add file to pending set and reset the debounce timer."""

@@ -134,30 +134,31 @@ const RETRY_BACKOFF_MS = 100;
 export class SqliteReader {
   private db: Database.Database | null = null;
 
-  constructor(dbPath: string) {
+  /**
+   * Create a SqliteReader with retry logic that does not block the event loop.
+   * Prefer this over the constructor when calling from async code.
+   */
+  static async create(dbPath: string): Promise<SqliteReader> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_OPEN_RETRIES; attempt++) {
       try {
-        this.db = new Database(dbPath, { readonly: true });
-        this.db.pragma('journal_mode = WAL');
-        this.db.pragma('busy_timeout = 5000');
-        return; // success
+        return new SqliteReader(dbPath);
       } catch (err) {
         lastError = err;
-        if (this.db) {
-          try { this.db.close(); } catch { /* ignore */ }
-          this.db = null;
-        }
         if (attempt < MAX_OPEN_RETRIES - 1) {
-          const sleepMs = RETRY_BACKOFF_MS * (attempt + 1);
-          const start = Date.now();
-          while (Date.now() - start < sleepMs) {
-            // busy-wait; better-sqlite3 is synchronous so no async available
-          }
+          await new Promise(resolve =>
+            setTimeout(resolve, RETRY_BACKOFF_MS * (attempt + 1))
+          );
         }
       }
     }
     throw lastError;
+  }
+
+  constructor(dbPath: string) {
+    this.db = new Database(dbPath, { readonly: true });
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('busy_timeout = 5000');
   }
 
   /**
@@ -184,8 +185,8 @@ export class SqliteReader {
           .get() as { value: string } | undefined;
         if (row) {
           const version = parseInt(row.value, 10);
-          // Current supported schema version
-          const SUPPORTED_SCHEMA_VERSION = 1;
+          // Must match LATEST_VERSION in code_review_graph/migrations.py
+          const SUPPORTED_SCHEMA_VERSION = 5;
           if (!isNaN(version) && version > SUPPORTED_SCHEMA_VERSION) {
             return `Database was created with a newer version (schema v${version}). Update the extension.`;
           }
