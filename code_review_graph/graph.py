@@ -17,6 +17,7 @@ from typing import Any, Optional
 
 import networkx as nx
 
+from .migrations import get_schema_version, run_migrations
 from .parser import EdgeInfo, NodeInfo
 
 # ---------------------------------------------------------------------------
@@ -127,6 +128,15 @@ class GraphStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
+        # Ensure schema_version is set, then run pending migrations
+        if get_schema_version(self._conn) < 1:
+            # Fresh DB — metadata table just created by _init_schema
+            self._conn.execute(
+                "INSERT OR IGNORE INTO metadata (key, value) "
+                "VALUES ('schema_version', '1')"
+            )
+            self._conn.commit()
+        run_migrations(self._conn)
         self._nxg_cache: nx.DiGraph | None = None
         self._cache_lock = threading.Lock()
 
@@ -222,12 +232,17 @@ class GraphStore:
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
-        self.remove_file_data(file_path)
-        for node in nodes:
-            self.upsert_node(node, file_hash=fhash)
-        for edge in edges:
-            self.upsert_edge(edge)
-        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self.remove_file_data(file_path)
+            for node in nodes:
+                self.upsert_node(node, file_hash=fhash)
+            for edge in edges:
+                self.upsert_edge(edge)
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
         self._invalidate_cache()
 
     def set_metadata(self, key: str, value: str) -> None:
@@ -345,9 +360,9 @@ class GraphStore:
         impacted: set[str] = set()
 
         while frontier and depth < max_depth:
+            visited.update(frontier)
             next_frontier: set[str] = set()
             for qn in frontier:
-                visited.add(qn)
                 # Forward edges (things this node affects)
                 if qn in nxg:
                     for neighbor in nxg.neighbors(qn):
@@ -360,24 +375,18 @@ class GraphStore:
                         if pred not in visited:
                             next_frontier.add(pred)
                             impacted.add(pred)
+            next_frontier -= visited
             # Cap total nodes to prevent resource exhaustion on dense graphs
             if len(visited) + len(next_frontier) > max_nodes:
                 break
             frontier = next_frontier
             depth += 1
 
-        # Resolve to full node info
-        changed_nodes = []
-        for qn in seeds:
-            node = self.get_node(qn)
-            if node:
-                changed_nodes.append(node)
+        # Batch-fetch nodes instead of N+1 individual queries
+        changed_nodes = self._batch_get_nodes(seeds)
 
-        impacted_nodes = []
-        for qn in impacted - seeds:
-            node = self.get_node(qn)
-            if node:
-                impacted_nodes.append(node)
+        impacted_qns = impacted - seeds
+        impacted_nodes = self._batch_get_nodes(impacted_qns)
 
         # Truncation: cap impacted nodes and report total
         total_impacted = len(impacted_nodes)
@@ -500,6 +509,254 @@ class GraphStore:
         ).fetchall()
         return [self._row_to_node(r) for r in rows]
 
+    # --- Public query helpers (used by flows, changes, communities, etc.) ---
+
+    def get_node_by_id(self, node_id: int) -> Optional[GraphNode]:
+        """Fetch a single node by its integer primary key."""
+        row = self._conn.execute(
+            "SELECT * FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        return self._row_to_node(row) if row else None
+
+    def get_nodes_by_kind(
+        self,
+        kinds: list[str],
+        file_pattern: str | None = None,
+    ) -> list[GraphNode]:
+        """Return nodes matching any of *kinds*, optionally filtered by file.
+
+        Args:
+            kinds: List of node kind strings (e.g. ``["Function", "Test"]``).
+            file_pattern: If provided, only nodes whose ``file_path``
+                contains *file_pattern* (SQL LIKE ``%pattern%``) are
+                returned.
+        """
+        if not kinds:
+            return []
+        placeholders = ",".join("?" for _ in kinds)
+        conditions = [f"kind IN ({placeholders})"]
+        params: list[str] = list(kinds)
+        if file_pattern:
+            conditions.append("file_path LIKE ?")
+            params.append(f"%{file_pattern}%")
+        where = " AND ".join(conditions)
+        rows = self._conn.execute(  # nosec B608
+            f"SELECT * FROM nodes WHERE {where}", params,
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
+    def count_flow_memberships(self, node_id: int) -> int:
+        """Return the number of flows a node participates in."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) as cnt FROM flow_memberships "
+            "WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    def get_node_community_id(self, node_id: int) -> int | None:
+        """Return the ``community_id`` for a node, or ``None``."""
+        row = self._conn.execute(
+            "SELECT community_id FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if row and row["community_id"] is not None:
+            return row["community_id"]
+        return None
+
+    def get_community_ids_by_qualified_names(
+        self, qns: list[str],
+    ) -> dict[str, int | None]:
+        """Batch-fetch ``community_id`` for a list of qualified names.
+
+        Returns a mapping from qualified name to community_id (may be
+        ``None`` if the node has no assigned community).
+        """
+        result: dict[str, int | None] = {}
+        batch_size = 450
+        for i in range(0, len(qns), batch_size):
+            batch = qns[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT qualified_name, community_id FROM nodes "
+                f"WHERE qualified_name IN ({placeholders})",
+                batch,
+            ).fetchall()
+            for r in rows:
+                result[r["qualified_name"]] = r["community_id"]
+        return result
+
+    def get_files_matching(self, pattern: str) -> list[str]:
+        """Return distinct ``file_path`` values matching a LIKE suffix."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT file_path FROM nodes "
+            "WHERE file_path LIKE ?",
+            (f"%{pattern}",),
+        ).fetchall()
+        return [r["file_path"] for r in rows]
+
+    def get_nodes_without_signature(self) -> list[sqlite3.Row]:
+        """Return raw rows for nodes that have no signature yet."""
+        return self._conn.execute(
+            "SELECT id, name, kind, params, return_type "
+            "FROM nodes WHERE signature IS NULL"
+        ).fetchall()
+
+    def update_node_signature(
+        self, node_id: int, signature: str,
+    ) -> None:
+        """Set the ``signature`` column for a single node."""
+        self._conn.execute(
+            "UPDATE nodes SET signature = ? WHERE id = ?",
+            (signature, node_id),
+        )
+
+    def get_all_community_ids(self) -> dict[str, int | None]:
+        """Return a mapping of *all* qualified names to their community_id.
+
+        Used primarily by the visualization exporter.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT qualified_name, community_id FROM nodes"
+            ).fetchall()
+            return {
+                r["qualified_name"]: r["community_id"]
+                for r in rows
+            }
+        except Exception:
+            return {}
+
+    def get_node_ids_by_files(
+        self, file_paths: list[str],
+    ) -> set[int]:
+        """Return node IDs belonging to the given file paths."""
+        if not file_paths:
+            return set()
+        result: set[int] = set()
+        batch_size = 450
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT id FROM nodes "
+                f"WHERE file_path IN ({placeholders})",
+                batch,
+            ).fetchall()
+            result.update(r["id"] for r in rows)
+        return result
+
+    def get_flow_ids_by_node_ids(
+        self, node_ids: set[int],
+    ) -> list[int]:
+        """Return distinct flow IDs that contain any of *node_ids*."""
+        if not node_ids:
+            return []
+        nids = list(node_ids)
+        result: list[int] = []
+        batch_size = 450
+        for i in range(0, len(nids), batch_size):
+            batch = nids[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT DISTINCT flow_id FROM flow_memberships "
+                f"WHERE node_id IN ({placeholders})",
+                batch,
+            ).fetchall()
+            result.extend(r["flow_id"] for r in rows)
+        # Deduplicate across batches
+        return list(dict.fromkeys(result))
+
+    def get_flow_qualified_names(self, flow_id: int) -> set[str]:
+        """Return the set of qualified names for nodes in a flow."""
+        rows = self._conn.execute(
+            "SELECT n.qualified_name FROM flow_memberships fm "
+            "JOIN nodes n ON fm.node_id = n.id WHERE fm.flow_id = ?",
+            (flow_id,),
+        ).fetchall()
+        return {r["qualified_name"] for r in rows}
+
+    def get_node_kind_by_id(self, node_id: int) -> str | None:
+        """Return just the ``kind`` column for a node, or ``None``."""
+        row = self._conn.execute(
+            "SELECT kind FROM nodes WHERE id = ?", (node_id,),
+        ).fetchone()
+        return row["kind"] if row else None
+
+    def get_all_call_targets(self) -> set[str]:
+        """Return the set of all CALLS-edge target qualified names."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT target_qualified FROM edges "
+            "WHERE kind = 'CALLS'"
+        ).fetchall()
+        return {r["target_qualified"] for r in rows}
+
+    def get_communities_list(
+        self,
+    ) -> list[sqlite3.Row]:
+        """Return raw rows from the ``communities`` table."""
+        try:
+            return self._conn.execute(
+                "SELECT id, name FROM communities"
+            ).fetchall()
+        except Exception:
+            return []
+
+    def get_community_member_qns(
+        self, community_id: int,
+    ) -> list[str]:
+        """Return qualified names of nodes in a community."""
+        rows = self._conn.execute(
+            "SELECT qualified_name FROM nodes "
+            "WHERE community_id = ?",
+            (community_id,),
+        ).fetchall()
+        return [r["qualified_name"] for r in rows]
+
+    def get_nodes_by_community_id(
+        self, community_id: int,
+    ) -> list[GraphNode]:
+        """Return all nodes belonging to a community."""
+        rows = self._conn.execute(
+            "SELECT * FROM nodes WHERE community_id = ?",
+            (community_id,),
+        ).fetchall()
+        return [self._row_to_node(r) for r in rows]
+
+    def get_outgoing_targets(
+        self, source_qns: list[str],
+    ) -> list[str]:
+        """Return ``target_qualified`` for edges sourced from *source_qns*."""
+        results: list[str] = []
+        batch_size = 450
+        for i in range(0, len(source_qns), batch_size):
+            batch = source_qns[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT target_qualified FROM edges "
+                f"WHERE source_qualified IN ({placeholders})",
+                batch,
+            ).fetchall()
+            results.extend(r["target_qualified"] for r in rows)
+        return results
+
+    def get_incoming_sources(
+        self, target_qns: list[str],
+    ) -> list[str]:
+        """Return ``source_qualified`` for edges targeting *target_qns*."""
+        results: list[str] = []
+        batch_size = 450
+        for i in range(0, len(target_qns), batch_size):
+            batch = target_qns[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                "SELECT source_qualified FROM edges "
+                f"WHERE target_qualified IN ({placeholders})",
+                batch,
+            ).fetchall()
+            results.extend(r["source_qualified"] for r in rows)
+        return results
+
     # --- Public edge access (for visualization etc.) ---
 
     def get_all_edges(self) -> list[GraphEdge]:
@@ -529,6 +786,23 @@ class GraphStore:
                 edge = self._row_to_edge(r)
                 if edge.target_qualified in qualified_names:
                     results.append(edge)
+        return results
+
+    def _batch_get_nodes(self, qualified_names: set[str]) -> list[GraphNode]:
+        """Batch-fetch nodes by qualified name, staying under SQLite variable limits."""
+        if not qualified_names:
+            return []
+        qns = list(qualified_names)
+        results: list[GraphNode] = []
+        batch_size = 450
+        for i in range(0, len(qns), batch_size):
+            batch = qns[i:i + batch_size]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(  # nosec B608
+                f"SELECT * FROM nodes WHERE qualified_name IN ({placeholders})",
+                batch,
+            ).fetchall()
+            results.extend(self._row_to_node(r) for r in rows)
         return results
 
     # --- Internal helpers ---

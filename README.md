@@ -10,7 +10,7 @@
   <a href="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml"><img src="https://github.com/tirth8205/code-review-graph/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg?style=flat-square" alt="Python 3.10+"></a>
   <a href="https://modelcontextprotocol.io/"><img src="https://img.shields.io/badge/MCP-compatible-green.svg?style=flat-square" alt="MCP"></a>
-  <a href="#"><img src="https://img.shields.io/badge/version-1.8.4-purple.svg?style=flat-square" alt="v1.8.4"></a>
+  <a href="#"><img src="https://img.shields.io/badge/version-2.0.0-purple.svg?style=flat-square" alt="v2.0.0"></a>
 </p>
 
 <br>
@@ -18,30 +18,42 @@
 Claude Code re-reads your entire codebase on every task. `code-review-graph` fixes that. It builds a structural map of your code with [Tree-sitter](https://tree-sitter.github.io/tree-sitter/), tracks changes incrementally, and gives Claude precise context so it reads only what matters.
 
 <p align="center">
-  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: 6.8x fewer tokens with higher review quality" width="85%" />
+  <img src="diagrams/diagram1_before_vs_after.png" alt="The Token Problem: 8.2x average token reduction across 6 real repositories" width="85%" />
 </p>
 
 ---
 
 ## Quick Start
 
-**Claude Code Plugin** (recommended)
-
-```bash
-claude plugin marketplace add tirth8205/code-review-graph
-claude plugin install code-review-graph@code-review-graph
-```
-
-**pip**
-
 ```bash
 pip install code-review-graph
-code-review-graph install
+code-review-graph install          # auto-detects and configures all supported platforms
+code-review-graph build            # parse your codebase
 ```
 
-Restart Claude Code after either method. Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+One command sets up everything. `install` detects which AI coding tools you have and writes the correct MCP configuration for each one. Restart your editor/tool after installing.
 
-Then open your project and tell Claude:
+To target a specific platform:
+
+```bash
+code-review-graph install --platform cursor      # configure only Cursor
+code-review-graph install --platform claude-code  # configure only Claude Code
+```
+
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/).
+
+### Supported Platforms
+
+| Platform | Config file | Auto-detected |
+|----------|-------------|:---:|
+| **Claude Code** | `.mcp.json` | Yes |
+| **Cursor** | `.cursor/mcp.json` | Yes |
+| **Windsurf** | `.windsurf/mcp.json` | Yes |
+| **Zed** | `.zed/settings.json` | Yes |
+| **Continue** | `.continue/config.json` | Yes |
+| **OpenCode** | `.opencode/config.json` | Yes |
+
+Then open your project and ask your AI assistant:
 
 ```
 Build the code review graph for this project
@@ -84,10 +96,10 @@ On every git commit or file save, a hook fires. The graph diffs changed files, f
 </details>
 
 <details>
-<summary><strong>14 supported languages</strong></summary>
+<summary><strong>18 supported languages</strong></summary>
 <br>
 
-Python, TypeScript, JavaScript, Vue, Go, Rust, Java, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++
+Python, TypeScript/TSX, JavaScript, Vue, Go, Rust, Java, Scala, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++, Dart, R, Perl
 
 Each language has full Tree-sitter grammar support for functions, classes, imports, call sites, inheritance, and test detection.
 
@@ -97,57 +109,68 @@ Each language has full Tree-sitter grammar support for functions, classes, impor
 
 ## Benchmarks
 
-All figures come from real tests on three production open-source repositories.
-
-<p align="center">
-  <img src="diagrams/diagram5_benchmark_board.png" alt="Benchmarks: httpx 27.3x, FastAPI 6.3x, Next.js 4.9x token reduction with higher review quality" width="90%" />
-</p>
+All numbers come from the automated evaluation runner against 6 real open-source repositories (13 commits total). Reproduce with `code-review-graph eval --all`. Raw data in [`evaluate/reports/summary.md`](evaluate/reports/summary.md).
 
 <details>
-<summary><strong>Code review benchmark details (6.8x average reduction)</strong></summary>
+<summary><strong>Token efficiency: 8.2x average reduction (naive vs graph)</strong></summary>
 <br>
 
-Tested across 6 real git commits. The graph replaces reading entire source files with a compact structural summary (156-207 tokens) covering blast radius, test coverage gaps, and dependency chains.
+The graph replaces reading entire source files with a compact structural context covering blast radius, dependency chains, and test coverage gaps.
 
-| Repo | Size | Standard Approach | With Graph | Reduction | Review Quality |
-|------|-----:|------------------:|-----------:|----------:|:-:|
-| [httpx](https://github.com/encode/httpx) | 125 files | 12,507 tokens | 458 tokens | 26.2x | 9.0 vs 7.0 |
-| [FastAPI](https://github.com/fastapi/fastapi) | 2,915 files | 5,495 tokens | 871 tokens | 8.1x | 8.5 vs 7.5 |
-| [Next.js](https://github.com/vercel/next.js) | 27,732 files | 21,614 tokens | 4,457 tokens | 6.0x | 9.0 vs 7.0 |
-| **Average** | | **13,205** | **1,928** | **6.8x** | **8.8 vs 7.2** |
+| Repo | Commits | Avg Naive Tokens | Avg Graph Tokens | Reduction |
+|------|--------:|-----------------:|----------------:|----------:|
+| express | 2 | 693 | 983 | 0.7x |
+| fastapi | 2 | 4,944 | 614 | 8.1x |
+| flask | 2 | 44,751 | 4,252 | 9.1x |
+| gin | 3 | 21,972 | 1,153 | 16.4x |
+| httpx | 2 | 12,044 | 1,728 | 6.9x |
+| nextjs | 2 | 9,882 | 1,249 | 8.0x |
+| **Average** | **13** | | | **8.2x** |
 
-Standard approach: reading all changed files plus the diff. Quality scored on accuracy, completeness, bug-catching potential, and actionable insight (1-10 scale).
+**Why express shows <1x:** For single-file changes in small packages, the graph context (metadata, edges, review guidance) can exceed the raw file size. The graph approach pays off on multi-file changes where it prunes irrelevant code.
 
 </details>
 
 <details>
-<summary><strong>Live coding task details (14.1x average, 49x peak)</strong></summary>
+<summary><strong>Impact accuracy: 100% recall, 0.54 average F1</strong></summary>
 <br>
 
-An agent performed 6 real coding tasks (adding features, fixing bugs) across the same repositories. The graph directed it to the right files and away from everything else.
+The blast-radius analysis never misses an actually impacted file (perfect recall). It over-predicts in some cases, which is a conservative trade-off — better to flag too many files than miss a broken dependency.
 
-| Task | Repo | With Graph | Without Graph | Reduction | Files Skipped |
-|------|------|--------:|-----------:|----------:|---:|
-| Add rate limiter | httpx | 14,090 | 64,666 | 4.6x | 58 |
-| Fix streaming bug | httpx | 14,090 | 64,666 | 4.6x | 59 |
-| Add rate limiter | FastAPI | 37,217 | 138,585 | 3.7x | 1,120 |
-| Fix streaming bug | FastAPI | 36,986 | 138,585 | 3.7x | 1,121 |
-| Add rate limiter | Next.js | 15,049 | 739,352 | 49.1x | ~16,000 |
-| Fix streaming bug | Next.js | 16,135 | 739,352 | 45.8x | ~16,000 |
-
-The graph identified the correct files in every case. Savings scale with repository size.
+| Repo | Commits | Avg F1 | Avg Precision | Recall |
+|------|--------:|-------:|--------------:|-------:|
+| express | 2 | 0.667 | 0.50 | 1.0 |
+| fastapi | 2 | 0.584 | 0.42 | 1.0 |
+| flask | 2 | 0.475 | 0.34 | 1.0 |
+| gin | 3 | 0.429 | 0.29 | 1.0 |
+| httpx | 2 | 0.762 | 0.63 | 1.0 |
+| nextjs | 2 | 0.331 | 0.20 | 1.0 |
+| **Average** | **13** | **0.54** | **0.38** | **1.0** |
 
 </details>
 
 <details>
-<summary><strong>Monorepo scale: the 49x case</strong></summary>
+<summary><strong>Build performance</strong></summary>
 <br>
 
-Large repositories benefit most. In the Next.js monorepo (27,732 files, 739K tokens), the graph narrows the review context to ~15 files and 15K tokens, a 49x reduction with 27,700+ files excluded entirely.
+| Repo | Files | Nodes | Edges | Flow Detection | Search Latency |
+|------|------:|------:|------:|---------------:|---------------:|
+| express | 141 | 1,910 | 17,553 | 106ms | 0.7ms |
+| fastapi | 1,122 | 6,285 | 27,117 | 128ms | 1.5ms |
+| flask | 83 | 1,446 | 7,974 | 95ms | 0.7ms |
+| gin | 99 | 1,286 | 16,762 | 111ms | 0.5ms |
+| httpx | 60 | 1,253 | 7,896 | 96ms | 0.4ms |
 
-<p align="center">
-  <img src="diagrams/diagram6_monorepo_funnel.png" alt="Next.js monorepo: 27,732 files funneled down to ~15 files, 49x fewer tokens" width="75%" />
-</p>
+</details>
+
+<details>
+<summary><strong>Limitations and known weaknesses</strong></summary>
+<br>
+
+- **Small single-file changes:** Graph context can exceed naive file reads for trivial edits (see express results above). The overhead is the structural metadata that enables multi-file analysis.
+- **Search quality (MRR 0.35):** Keyword search finds the right result in the top-4 for most queries, but ranking needs improvement. Express queries return 0 hits due to module-pattern naming.
+- **Flow detection (33% recall):** Only reliably detects entry points in Python repos (fastapi, httpx) where framework patterns are recognized. JavaScript and Go flow detection needs work.
+- **Precision vs recall trade-off:** Impact analysis is deliberately conservative. It flags files that *might* be affected, which means some false positives in large dependency graphs.
 
 </details>
 
@@ -172,13 +195,20 @@ Large repositories benefit most. In the Next.js monorepo (27,732 files, 739K tok
 <br>
 
 ```bash
-code-review-graph install     # Register MCP server with Claude Code
-code-review-graph build       # Parse entire codebase
-code-review-graph update      # Incremental update (changed files only)
-code-review-graph status      # Graph statistics
-code-review-graph watch       # Auto-update on file changes
-code-review-graph visualize   # Generate interactive HTML graph
-code-review-graph serve       # Start MCP server
+code-review-graph install          # Auto-detect and configure all platforms
+code-review-graph install --platform <name>  # Target a specific platform
+code-review-graph build            # Parse entire codebase
+code-review-graph update           # Incremental update (changed files only)
+code-review-graph status           # Graph statistics
+code-review-graph watch            # Auto-update on file changes
+code-review-graph visualize        # Generate interactive HTML graph
+code-review-graph wiki             # Generate markdown wiki from communities
+code-review-graph detect-changes   # Risk-scored change impact analysis
+code-review-graph register <path>  # Register repo in multi-repo registry
+code-review-graph unregister <id>  # Remove repo from registry
+code-review-graph repos            # List registered repositories
+code-review-graph eval             # Run evaluation benchmarks
+code-review-graph serve            # Start MCP server
 ```
 
 </details>
@@ -200,6 +230,22 @@ Claude uses these automatically once the graph is built.
 | `list_graph_stats_tool` | Graph size and health |
 | `get_docs_section_tool` | Retrieve documentation sections |
 | `find_large_functions_tool` | Find functions/classes exceeding a line-count threshold |
+| `list_flows_tool` | List execution flows sorted by criticality |
+| `get_flow_tool` | Get details of a single execution flow |
+| `get_affected_flows_tool` | Find flows affected by changed files |
+| `list_communities_tool` | List detected code communities |
+| `get_community_tool` | Get details of a single community |
+| `get_architecture_overview_tool` | Architecture overview from community structure |
+| `detect_changes_tool` | Risk-scored change impact analysis for code review |
+| `refactor_tool` | Rename preview, dead code detection, suggestions |
+| `apply_refactor_tool` | Apply a previously previewed refactoring |
+| `generate_wiki_tool` | Generate markdown wiki from communities |
+| `get_wiki_page_tool` | Retrieve a specific wiki page |
+| `list_repos_tool` | List registered repositories |
+| `cross_repo_search_tool` | Search across all registered repositories |
+
+**MCP Prompts** (5 workflow templates):
+`review_changes`, `architecture_map`, `debug_issue`, `onboard_developer`, `pre_merge_check`
 
 </details>
 
@@ -210,13 +256,22 @@ Claude uses these automatically once the graph is built.
 | Feature | Details |
 |---------|---------|
 | **Incremental updates** | Re-parses only changed files. Subsequent updates complete in under 2 seconds. |
-| **14 languages** | Python, TypeScript, JavaScript, Vue, Go, Rust, Java, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++ |
+| **18 languages** | Python, TypeScript/TSX, JavaScript, Vue, Go, Rust, Java, Scala, C#, Ruby, Kotlin, Swift, PHP, Solidity, C/C++, Dart, R, Perl |
 | **Blast-radius analysis** | Shows exactly which functions, classes, and files are affected by any change |
 | **Auto-update hooks** | Graph updates on every file edit and git commit without manual intervention |
-| **Semantic search** | Optional vector embeddings via sentence-transformers |
+| **Semantic search** | Optional vector embeddings via sentence-transformers, Google Gemini, or MiniMax |
 | **Interactive visualisation** | D3.js force-directed graph with edge-type toggles and search |
 | **Local storage** | SQLite file in `.code-review-graph/`. No external database, no cloud dependency. |
 | **Watch mode** | Continuous graph updates as you work |
+| **Execution flows** | Trace call chains from entry points, sorted by criticality |
+| **Community detection** | Cluster related code via Leiden algorithm or file grouping |
+| **Architecture overview** | Auto-generated architecture map with coupling warnings |
+| **Risk-scored reviews** | `detect_changes` maps diffs to affected functions, flows, and test gaps |
+| **Refactoring tools** | Rename preview, dead code detection, community-driven suggestions |
+| **Wiki generation** | Auto-generate markdown wiki from community structure |
+| **Multi-repo registry** | Register multiple repos, search across all of them |
+| **MCP prompts** | 5 workflow templates: review, architecture, debug, onboard, pre-merge |
+| **Full-text search** | FTS5-powered hybrid search combining keyword and vector similarity |
 
 <details>
 <summary><strong>Configuration</strong></summary>
@@ -231,10 +286,15 @@ vendor/**
 node_modules/**
 ```
 
-For semantic search, install the optional embeddings dependencies:
+Optional dependency groups:
 
 ```bash
-pip install code-review-graph[embeddings]
+pip install code-review-graph[embeddings]          # Local vector embeddings (sentence-transformers)
+pip install code-review-graph[google-embeddings]   # Google Gemini embeddings
+pip install code-review-graph[communities]         # Community detection (igraph)
+pip install code-review-graph[eval]                # Evaluation benchmarks (matplotlib)
+pip install code-review-graph[wiki]                # Wiki generation with LLM summaries (ollama)
+pip install code-review-graph[all]                 # All optional dependencies
 ```
 
 </details>
@@ -265,5 +325,6 @@ MIT. See [LICENSE](LICENSE).
 
 <p align="center">
 <br>
-<code>pip install code-review-graph && code-review-graph install</code>
+<code>pip install code-review-graph && code-review-graph install</code><br>
+<sub>Works with Claude Code, Cursor, Windsurf, Zed, Continue, and OpenCode</sub>
 </p>

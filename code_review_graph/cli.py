@@ -9,6 +9,11 @@ Usage:
     code-review-graph status
     code-review-graph serve
     code-review-graph visualize
+    code-review-graph wiki
+    code-review-graph detect-changes [--base BASE] [--brief]
+    code-review-graph register <path> [--alias name]
+    code-review-graph unregister <path_or_alias>
+    code-review-graph repos
 """
 
 from __future__ import annotations
@@ -69,13 +74,19 @@ def _print_banner() -> None:
 {c}  ●──●──●{r}       {d}smarter code reviews{r}
 
   {b}Commands:{r}
-    {g}install{r}     Set up Claude Code integration
+    {g}install{r}     Set up MCP server for AI coding platforms
     {g}init{r}        Alias for install
     {g}build{r}       Full graph build {d}(parse all files){r}
     {g}update{r}      Incremental update {d}(changed files only){r}
     {g}watch{r}       Auto-update on file changes
     {g}status{r}      Show graph statistics
     {g}visualize{r}   Generate interactive HTML graph
+    {g}wiki{r}        Generate markdown wiki from communities
+    {g}detect-changes{r} Analyze change impact {d}(risk-scored review){r}
+    {g}register{r}    Register a repository in the multi-repo registry
+    {g}unregister{r}  Remove a repository from the registry
+    {g}repos{r}       List registered repositories
+    {g}eval{r}        Run evaluation benchmarks
     {g}serve{r}       Start MCP server
 
   {d}Run{r} {b}code-review-graph <command> --help{r} {d}for details{r}
@@ -83,48 +94,47 @@ def _print_banner() -> None:
 
 
 def _handle_init(args: argparse.Namespace) -> None:
-    """Set up .mcp.json in the project root for Claude Code integration."""
+    """Set up MCP config for detected AI coding platforms."""
     from .incremental import find_repo_root
+    from .skills import install_platform_configs
 
     repo_root = Path(args.repo) if args.repo else find_repo_root()
     if not repo_root:
         repo_root = Path.cwd()
 
-    mcp_path = repo_root / ".mcp.json"
     dry_run = getattr(args, "dry_run", False)
+    target = getattr(args, "platform", "all") or "all"
 
-    mcp_config = {
-        "mcpServers": {
-            "code-review-graph": {
-                "command": "uvx",
-                "args": ["code-review-graph", "serve"],
-            }
-        }
-    }
+    print("Installing MCP server config...")
+    configured = install_platform_configs(repo_root, target=target, dry_run=dry_run)
 
-    # Merge into existing .mcp.json if present
-    if mcp_path.exists():
-        try:
-            existing = json.loads(mcp_path.read_text())
-            if "code-review-graph" in existing.get("mcpServers", {}):
-                print(f"Already configured in {mcp_path}")
-                return
-            existing.setdefault("mcpServers", {}).update(mcp_config["mcpServers"])
-            mcp_config = existing
-        except json.JSONDecodeError:
-            print(f"Warning: existing {mcp_path} has invalid JSON, overwriting.")
-        except (KeyError, TypeError):
-            print(f"Warning: existing {mcp_path} has unexpected structure, overwriting.")
+    if not configured:
+        print("No platforms detected.")
+    else:
+        print(f"\nConfigured {len(configured)} platform(s): {', '.join(configured)}")
 
     if dry_run:
-        print(f"[dry-run] Would write to {mcp_path}:")
-        print(json.dumps(mcp_config, indent=2))
-        print()
-        print("[dry-run] No files were modified.")
+        print("\n[dry-run] No files were modified.")
         return
 
-    mcp_path.write_text(json.dumps(mcp_config, indent=2) + "\n")
-    print(f"Created {mcp_path}")
+    # Handle --skills, --hooks, --all flags
+    install_all = getattr(args, "install_all", False)
+    want_skills = getattr(args, "skills", False) or install_all
+    want_hooks = getattr(args, "hooks", False) or install_all
+
+    if want_skills or want_hooks:
+        from .skills import generate_skills, inject_claude_md, install_hooks
+
+        if want_skills:
+            skills_dir = generate_skills(repo_root)
+            print(f"Generated skills in {skills_dir}")
+            inject_claude_md(repo_root)
+            print("Updated CLAUDE.md with MCP tools reference")
+
+        if want_hooks:
+            install_hooks(repo_root)
+            print(f"Installed hooks in {repo_root / '.claude' / 'settings.json'}")
+
     print()
     print("Next steps:")
     print("  1. code-review-graph build    # build the knowledge graph")
@@ -144,12 +154,33 @@ def main() -> None:
 
     # install (primary) + init (alias)
     install_cmd = sub.add_parser(
-        "install", help="Register MCP server with Claude Code (creates .mcp.json)"
+        "install", help="Register MCP server with AI coding platforms"
     )
     install_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
     install_cmd.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be done without writing files",
+    )
+    install_cmd.add_argument(
+        "--skills", action="store_true",
+        help="Generate Claude Code skill files in .claude/skills/",
+    )
+    install_cmd.add_argument(
+        "--hooks", action="store_true",
+        help="Install Claude Code hooks in .claude/settings.json",
+    )
+    install_cmd.add_argument(
+        "--all", action="store_true", dest="install_all",
+        help="Install skills, hooks, and CLAUDE.md integration",
+    )
+    install_cmd.add_argument(
+        "--platform",
+        choices=[
+            "claude", "cursor", "windsurf", "zed",
+            "continue", "opencode", "antigravity", "all",
+        ],
+        default="all",
+        help="Target platform for MCP config (default: all detected)",
     )
 
     init_cmd = sub.add_parser(
@@ -159,6 +190,27 @@ def main() -> None:
     init_cmd.add_argument(
         "--dry-run", action="store_true",
         help="Show what would be done without writing files",
+    )
+    init_cmd.add_argument(
+        "--skills", action="store_true",
+        help="Generate Claude Code skill files in .claude/skills/",
+    )
+    init_cmd.add_argument(
+        "--hooks", action="store_true",
+        help="Install Claude Code hooks in .claude/settings.json",
+    )
+    init_cmd.add_argument(
+        "--all", action="store_true", dest="install_all",
+        help="Install skills, hooks, and CLAUDE.md integration",
+    )
+    init_cmd.add_argument(
+        "--platform",
+        choices=[
+            "claude", "cursor", "windsurf", "zed",
+            "continue", "opencode", "antigravity", "all",
+        ],
+        default="all",
+        help="Target platform for MCP config (default: all detected)",
     )
 
     # build
@@ -181,6 +233,56 @@ def main() -> None:
     # visualize
     vis_cmd = sub.add_parser("visualize", help="Generate interactive HTML graph visualization")
     vis_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    vis_cmd.add_argument(
+        "--serve", action="store_true",
+        help="Start a local HTTP server to view the visualization (localhost:8765)",
+    )
+
+    # wiki
+    wiki_cmd = sub.add_parser("wiki", help="Generate markdown wiki from community structure")
+    wiki_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    wiki_cmd.add_argument(
+        "--force", action="store_true",
+        help="Regenerate all pages even if content unchanged",
+    )
+
+    # register
+    register_cmd = sub.add_parser(
+        "register", help="Register a repository in the multi-repo registry"
+    )
+    register_cmd.add_argument("path", help="Path to the repository root")
+    register_cmd.add_argument("--alias", default=None, help="Short alias for the repository")
+
+    # unregister
+    unregister_cmd = sub.add_parser(
+        "unregister", help="Remove a repository from the multi-repo registry"
+    )
+    unregister_cmd.add_argument("path_or_alias", help="Repository path or alias to remove")
+
+    # repos
+    sub.add_parser("repos", help="List registered repositories")
+
+    # eval
+    eval_cmd = sub.add_parser("eval", help="Run evaluation benchmarks")
+    eval_cmd.add_argument(
+        "--benchmark", default=None,
+        help="Comma-separated benchmarks to run (token_efficiency, impact_accuracy, "
+             "flow_completeness, search_quality, build_performance)",
+    )
+    eval_cmd.add_argument("--repo", default=None, help="Comma-separated repo config names")
+    eval_cmd.add_argument("--all", action="store_true", dest="run_all", help="Run all benchmarks")
+    eval_cmd.add_argument("--report", action="store_true", help="Generate report from results")
+    eval_cmd.add_argument("--output-dir", default=None, help="Output directory for results")
+
+    # detect-changes
+    detect_cmd = sub.add_parser("detect-changes", help="Analyze change impact")
+    detect_cmd.add_argument(
+        "--base", default="HEAD~1", help="Git diff base (default: HEAD~1)"
+    )
+    detect_cmd.add_argument(
+        "--brief", action="store_true", help="Show brief summary only"
+    )
+    detect_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
 
     # serve
     serve_cmd = sub.add_parser("serve", help="Start MCP server (stdio transport)")
@@ -201,8 +303,81 @@ def main() -> None:
         serve_main(repo_root=args.repo)
         return
 
+    if args.command == "eval":
+        from .eval.reporter import generate_full_report, generate_readme_tables
+        from .eval.runner import run_eval
+
+        if getattr(args, "report", False):
+            output_dir = Path(
+                getattr(args, "output_dir", None) or "evaluate/results"
+            )
+            report = generate_full_report(output_dir)
+            report_path = Path("evaluate/reports/summary.md")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(report, encoding="utf-8")
+            print(f"Report written to {report_path}")
+
+            tables = generate_readme_tables(output_dir)
+            print("\n--- README Tables (copy-paste) ---\n")
+            print(tables)
+        else:
+            repos = (
+                [r.strip() for r in args.repo.split(",")]
+                if getattr(args, "repo", None)
+                else None
+            )
+            benchmarks = (
+                [b.strip() for b in args.benchmark.split(",")]
+                if getattr(args, "benchmark", None)
+                else None
+            )
+
+            if not repos and not benchmarks and not getattr(args, "run_all", False):
+                print("Specify --all, --repo, or --benchmark. See --help.")
+                return
+
+            results = run_eval(
+                repos=repos,
+                benchmarks=benchmarks,
+                output_dir=getattr(args, "output_dir", None),
+            )
+            print(f"\nCompleted {len(results)} benchmark(s).")
+            print("Run 'code-review-graph eval --report' to generate tables.")
+        return
+
     if args.command in ("init", "install"):
         _handle_init(args)
+        return
+
+    if args.command in ("register", "unregister", "repos"):
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+        from .registry import Registry
+
+        registry = Registry()
+        if args.command == "register":
+            try:
+                entry = registry.register(args.path, alias=args.alias)
+                alias_info = f" (alias: {entry['alias']})" if entry.get("alias") else ""
+                print(f"Registered: {entry['path']}{alias_info}")
+            except ValueError as exc:
+                logging.error(str(exc))
+                sys.exit(1)
+        elif args.command == "unregister":
+            if registry.unregister(args.path_or_alias):
+                print(f"Unregistered: {args.path_or_alias}")
+            else:
+                print(f"Not found: {args.path_or_alias}")
+                sys.exit(1)
+        elif args.command == "repos":
+            repos = registry.list_repos()
+            if not repos:
+                print("No repositories registered.")
+                print("Use: code-review-graph register <path> [--alias name]")
+            else:
+                for entry in repos:
+                    alias = entry.get("alias", "")
+                    alias_str = f"  ({alias})" if alias else ""
+                    print(f"  {entry['path']}{alias_str}")
         return
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -217,11 +392,14 @@ def main() -> None:
         watch,
     )
 
-    if args.command == "update":
-        # update requires git for diffing
+    if args.command in ("update", "detect-changes"):
+        # update and detect-changes require git for diffing
         repo_root = Path(args.repo) if args.repo else find_repo_root()
         if not repo_root:
-            logging.error("Not in a git repository. 'update' requires git for diffing.")
+            logging.error(
+                "Not in a git repository. '%s' requires git for diffing.",
+                args.command,
+            )
             logging.error("Use 'build' for a full parse, or run 'git init' first.")
             sys.exit(1)
     else:
@@ -263,7 +441,61 @@ def main() -> None:
             html_path = repo_root / ".code-review-graph" / "graph.html"
             generate_html(store, html_path)
             print(f"Visualization: {html_path}")
-            print("Open in browser to explore your codebase graph.")
+            if getattr(args, "serve", False):
+                import functools
+                import http.server
+
+                serve_dir = html_path.parent
+                port = 8765
+                handler = functools.partial(
+                    http.server.SimpleHTTPRequestHandler,
+                    directory=str(serve_dir),
+                )
+                print(f"Serving at http://localhost:{port}/graph.html")
+                print("Press Ctrl+C to stop.")
+                with http.server.HTTPServer(("localhost", port), handler) as httpd:
+                    try:
+                        httpd.serve_forever()
+                    except KeyboardInterrupt:
+                        print("\nServer stopped.")
+            else:
+                print("Open in browser to explore your codebase graph.")
+
+        elif args.command == "wiki":
+            from .wiki import generate_wiki
+            wiki_dir = repo_root / ".code-review-graph" / "wiki"
+            result = generate_wiki(store, wiki_dir, force=args.force)
+            total = result["pages_generated"] + result["pages_updated"] + result["pages_unchanged"]
+            print(
+                f"Wiki: {result['pages_generated']} new, "
+                f"{result['pages_updated']} updated, "
+                f"{result['pages_unchanged']} unchanged "
+                f"({total} total pages)"
+            )
+            print(f"Output: {wiki_dir}")
+
+        elif args.command == "detect-changes":
+            from .changes import analyze_changes
+            from .incremental import get_changed_files, get_staged_and_unstaged
+
+            base = args.base
+            changed = get_changed_files(repo_root, base)
+            if not changed:
+                changed = get_staged_and_unstaged(repo_root)
+
+            if not changed:
+                print("No changes detected.")
+            else:
+                result = analyze_changes(
+                    store,
+                    changed,
+                    repo_root=str(repo_root),
+                    base=base,
+                )
+                if args.brief:
+                    print(result.get("summary", "No summary available."))
+                else:
+                    print(json.dumps(result, indent=2, default=str))
 
     finally:
         store.close()
