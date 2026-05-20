@@ -4,6 +4,12 @@ on:
   release:
     types: [published]
 
+# Least-privilege at workflow root (post-tj-actions/changed-files era, CVE-2025-30066).
+# Publish job only reads the repo; PyPI auth is via TWINE_PASSWORD secret, so no
+# elevated GitHub-token scope is required.
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
